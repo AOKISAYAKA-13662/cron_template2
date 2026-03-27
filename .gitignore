@@ -1,2 +1,6 @@
 .env
 .claude/
+.venv/
+logs/
+__pycache__/
+*.png
