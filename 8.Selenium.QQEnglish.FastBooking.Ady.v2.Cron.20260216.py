@@ -312,12 +312,19 @@ return {'status': 'error', 'msg': 'hidden input not found'};
 chrome_options = webdriver.ChromeOptions()
 chrome_options.add_argument('--no-sandbox')
 chrome_options.add_argument('--disable-dev-shm-usage')
-chrome_options.page_load_strategy = 'eager'
+chrome_options.page_load_strategy = 'normal'
 
 # [Cron] ヘッドレスモード
 chrome_options.add_argument('--headless=new')
 chrome_options.add_argument('--window-size=1280,800')
 chrome_options.add_argument('--disable-gpu')
+
+# [Cron] bot検知回避
+chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+
+# [Cron] macOSキーチェーンへのアクセスを回避（cron環境でのハング防止）
+chrome_options.add_argument('--use-mock-keychain')
+chrome_options.add_argument('--password-store=basic')
 
 # 14日後の日付を計算
 target_date, day_name, date_str = get_target_date_info()
@@ -364,6 +371,8 @@ try:
     print("[-] initializing webdriver (using Selenium Manager)...")
     chrome_driver = webdriver.Chrome(options=chrome_options)
     chrome_driver.set_window_size(1280, 800)
+    chrome_driver.set_page_load_timeout(60)
+    chrome_driver.set_script_timeout(60)
     print("✓ Chromeブラウザの起動に成功しました")
 
     wait = WebDriverWait(chrome_driver, 20)
@@ -375,7 +384,10 @@ try:
     print("フェーズ1: QQ Englishにログイン")
     print("=" * 60)
 
-    chrome_driver.get('https://qqeng.com/q/login/')
+    try:
+        chrome_driver.get('https://qqeng.com/q/login/')
+    except Exception:
+        pass  # [Cron] ページロードタイムアウト時も続行
     print(f"✓ ログインページを開きました: {chrome_driver.current_url}")
     time.sleep(2)
 
@@ -396,7 +408,10 @@ try:
     print(f"✓ パスワードを入力しました: {'*' * len(QQ_PASSWORD)}")
 
     print("[-] ログインを送信中...")
-    password_input.submit()
+    try:
+        password_input.submit()
+    except Exception:
+        pass  # [Cron] タイムアウト時も続行
     time.sleep(5)
     print("✓ ログインが完了しました")
 
@@ -411,7 +426,10 @@ try:
     print(f"[-] スケジュールページを開きます...")
     print(f"  URL: {teacher_schedule_url}")
 
-    chrome_driver.get(teacher_schedule_url)
+    try:
+        chrome_driver.get(teacher_schedule_url)
+    except Exception:
+        pass  # [Cron] タイムアウト時も続行
     time.sleep(3)
 
     ensure_24h_selected(chrome_driver)
@@ -442,7 +460,10 @@ try:
     # ステップ3: ページを事前準備
     teacher_schedule_url = f"{TEACHER_URL_ADY}?date={date_str}&time_span=0&lesson_time=25"
     print(f"[-] ページを事前準備します: {teacher_schedule_url}")
-    chrome_driver.get(teacher_schedule_url)
+    try:
+        chrome_driver.get(teacher_schedule_url)
+    except Exception:
+        pass  # [Cron] タイムアウト時も続行
     time.sleep(2)
     ensure_24h_selected(chrome_driver)
     print("✓ ページの事前準備完了")
@@ -458,7 +479,10 @@ try:
     print("\n" + "=" * 60)
     print(f"★★★ {SNIPE_TIME_STR} - リフレッシュ実行！ ★★★")
     print("=" * 60)
-    chrome_driver.refresh()
+    try:
+        chrome_driver.refresh()
+    except Exception:
+        pass  # [Cron] タイムアウト時も続行
     print(f"✓ リフレッシュ実行: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
 
     # ページ読み込み完了を待機
@@ -659,7 +683,10 @@ try:
 
             if not modal_closed:
                 print(f"  (d) 最終手段: ページを再読み込みします")
-                chrome_driver.get(teacher_schedule_url)
+                try:
+                    chrome_driver.get(teacher_schedule_url)
+                except Exception:
+                    pass
 
             print(f"[-] [TEST] スケジュール復帰を待機中...")
             try:
@@ -671,7 +698,10 @@ try:
                 print(f"✓ [TEST] 検証成功 (time-from={time_from})")
             except Exception as e:
                 print(f"[!] [TEST] スケジュール復帰タイムアウト: {e}")
-                chrome_driver.get(teacher_schedule_url)
+                try:
+                    chrome_driver.get(teacher_schedule_url)
+                except Exception:
+                    pass
                 time.sleep(3)
 
         else:
