@@ -479,12 +479,7 @@ try:
     print("\n" + "=" * 60)
     print(f"★★★ {SNIPE_TIME_STR} - リフレッシュ実行！ ★★★")
     print("=" * 60)
-    chrome_driver.set_page_load_timeout(3)  # [Cron] 即タイムアウトして予約ループへ
-    try:
-        chrome_driver.refresh()
-    except Exception:
-        pass  # [Cron] タイムアウト時も続行
-    chrome_driver.set_page_load_timeout(60)  # [Cron] 予約ループ用に戻す
+    chrome_driver.execute_script("location.reload()")  # [Cron] タイムアウト待機なしで即リロード
     print(f"✓ リフレッシュ実行: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
 
     # ページ読み込み完了を待機
@@ -771,8 +766,11 @@ try:
     timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
     screenshot_filename = f"qqenglish_fastbooking_ady_{timestamp}.png"
     screenshot_path = os.path.join(script_dir, screenshot_filename)
-    chrome_driver.save_screenshot(screenshot_path)
-    print(f"✓ スクリーンショットを保存しました: {screenshot_path}")
+    try:
+        chrome_driver.save_screenshot(screenshot_path)
+        print(f"✓ スクリーンショットを保存しました: {screenshot_path}")
+    except Exception:
+        print(f"[!] スクリーンショット撮影に失敗しました")
 
     # ============================================================
     # 完了
