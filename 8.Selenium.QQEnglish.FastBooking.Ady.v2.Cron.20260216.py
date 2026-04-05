@@ -479,7 +479,12 @@ try:
     print("\n" + "=" * 60)
     print(f"★★★ {SNIPE_TIME_STR} - リフレッシュ実行！ ★★★")
     print("=" * 60)
-    chrome_driver.execute_script("location.reload()")  # [Cron] タイムアウト待機なしで即リロード
+    chrome_driver.set_page_load_timeout(2)  # [Cron] 2秒でタイムアウトして即予約ループへ
+    try:
+        chrome_driver.execute_script("location.reload()")
+    except Exception:
+        pass  # [Cron] タイムアウト時も続行
+    chrome_driver.set_page_load_timeout(60)  # [Cron] 予約ループ用に戻す
     print(f"✓ リフレッシュ実行: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
 
     # ページ読み込み完了を待機
