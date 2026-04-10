@@ -422,7 +422,7 @@ try:
     print("フェーズ2: Ady先生のスケジュールページに移動")
     print("=" * 60)
 
-    teacher_schedule_url = f"{TEACHER_URL_ADY}?date={date_str}&time_span=0&lesson_time=25"
+    teacher_schedule_url = f"{TEACHER_URL_ADY}?date={date_str}&time_span=0&lesson_time=30"
     print(f"[-] スケジュールページを開きます...")
     print(f"  URL: {teacher_schedule_url}")
 
@@ -458,7 +458,7 @@ try:
     print(f"\n[*] ターゲット日付（再計算）: {date_str} ({day_name})")
 
     # ステップ3: ページを事前準備
-    teacher_schedule_url = f"{TEACHER_URL_ADY}?date={date_str}&time_span=0&lesson_time=25"
+    teacher_schedule_url = f"{TEACHER_URL_ADY}?date={date_str}&time_span=0&lesson_time=30"
     print(f"[-] ページを事前準備します: {teacher_schedule_url}")
     try:
         chrome_driver.get(teacher_schedule_url)
