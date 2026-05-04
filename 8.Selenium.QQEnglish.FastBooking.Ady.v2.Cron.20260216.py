@@ -1,23 +1,18 @@
 # ============================================================
-# Ady先生専用 朝4:00 予約争奪戦スナイパー【最強版・Cron自動実行】
+# Ady先生専用 朝4:00 予約争奪戦スナイパー【直接POST版・Cron自動実行】
 #
-# 元ファイル: 8.Selenium.QQEnglish.FastBooking.Ady.v2.20260216.py
-# 変更点: headless / input()スキップ / 終了時quit()
+# 元ファイル: 8.Selenium.QQEnglish.FastBooking.Ady.v2.Cron.20260216.py
+# 変更点: ページリロード＋DOM操作 → 直接POST方式に全面書き換え
 #
-# FastBooking（元）の無限リトライ + FastBooking.Adyの堅牢な予約フロー
-# を組み合わせた最強バージョン
-#
-# 【組み合わせたメリット】
-# ✓ FastBooking（元）: whileリトライ（枠が出るまで50msごとに叩き続ける）
-# ✓ FastBooking.Ady  : clicked_slots重複防止、WebDriverWaitモーダル待機
-# ✓ 新規追加        : 3段階ステータス（none/all_excluded/clicked）で
-#                      「枠未出現」と「全枠予約済み」を区別
+# 【直接POST版のメリット】
+# ✓ ページリロード不要（3秒→0秒）
+# ✓ 10枠同時にPOST送信（並列処理）
+# ✓ crumb取得→確定POSTの2段階で最速予約（約1秒）
+# ✓ 優先順位に従って上から順に最大3枠を自動確定
 # ============================================================
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
@@ -25,6 +20,7 @@ import time
 import datetime
 from datetime import datetime as dt
 import os
+import json
 
 
 # ============================================================
@@ -41,18 +37,33 @@ TEACHER_URL_ADY = os.getenv("TEACHER_URL_ADY")
 # ============================================================
 # 設定値
 # ============================================================
-# 【本番用】朝4:00の予約争奪戦
-# 【テスト用】WAKEUP_TIME_STR = "", SNIPE_TIME_STR = "HH:MM:58.0"
-# ============================================================
-WAKEUP_TIME_STR = "03:58"       # 起床時刻（ページ事前準備）
-SNIPE_TIME_STR = "03:59:58.0"   # 3:59:58にリフレッシュ
-REFRESH_INTERVAL = 0.05          # リトライ間隔（50ms）
+WAKEUP_TIME_STR = "03:50"       # 起床時刻（ページ事前準備）
+SNIPE_TIME_STR = "04:00:00.0"   # 4:00:00.0 に直接POST送信
 MAX_BOOKINGS = 3                 # 最大予約数
-MAX_RETRIES = 100                # 枠未出現時の最大リトライ回数（50ms×100=最大5秒）
 
-# TEST_MODE = True  → 予約確定ボタンをクリックしない（検証のみ）
+# TEST_MODE = True  → 確定POSTを送信しない（crumb取得まで）
 # TEST_MODE = False → 実際に予約を確定する（本番）
 TEST_MODE = False
+
+# Ady先生のteacher_id（URLから取得）
+TEACHER_ID = "47422782"
+
+# カリキュラムID: カランメソッド（25分）
+CURRICULUM_ID = "1010090"
+
+# 予約枠の優先順位（過去実績に基づく）
+SLOT_PRIORITY = [
+    ("11:30", "12:00"),
+    ("11:00", "11:30"),
+    ("14:30", "15:00"),
+    ("14:00", "14:30"),
+    ("10:00", "10:30"),
+    ("10:30", "11:00"),
+    ("16:30", "17:00"),
+    ("17:30", "18:00"),
+    ("16:00", "16:30"),
+    ("15:30", "16:00"),
+]
 
 
 # ============================================================
@@ -120,7 +131,7 @@ def wait_until_time(target_time_str, purpose=""):
 # ============================================================
 def wait_until_snipe_time_precise():
     """
-    スナイプ時刻（3:59:58.0）まで精密に待機
+    スナイプ時刻まで精密に待機
     - 残り10秒以上: 1秒ごと
     - 残り10秒以内: 100msごと
     - 残り1秒以内: 10msごと
@@ -165,144 +176,99 @@ def wait_until_snipe_time_precise():
 
 
 # ============================================================
-# 24時間表示を確実に選択する関数
+# フェーズ1用JavaScript: 10枠を50ms間隔で順次ダイアログ取得POST
 # ============================================================
-def ensure_24h_selected(driver):
-    """時間帯選択で「24時間」を確実に選択する"""
-    print("[-] 24時間表示を選択中...")
-    try:
-        try:
-            selects = driver.find_elements(By.TAG_NAME, "select")
-            for sel in selects:
-                try:
-                    s = Select(sel)
-                    for opt in s.options:
-                        if "24時間" in opt.text:
-                            s.select_by_visible_text("24時間")
-                            print("✓ 24時間を選択しました（native Select）")
-                            return
-                except:
-                    continue
-        except:
-            pass
+JS_FETCH_DIALOGS = """
+var slots = arguments[0];
+var teacherId = arguments[1];
+var dateStr = arguments[2];
+var delay = arguments[3];
+var callback = arguments[4];
 
-        trigger_xpath = "//*[contains(text(), '~') and contains(text(), ':')]"
-        trigger_with_range = driver.find_elements(By.XPATH, trigger_xpath)
+var results = {};
+var completed = 0;
+var total = slots.length;
 
-        if trigger_with_range:
-            print(f"[-] 時間範囲トリガーを発見: {trigger_with_range[0].text}")
-            driver.execute_script("arguments[0].click();", trigger_with_range[0])
-            time.sleep(0.5)
+function fetchSlot(index) {
+    if (index >= total) return;
+    var slot = slots[index];
+    var timeFrom = slot[0];
+    var timeTo = slot[1];
+    var key = timeFrom;
 
-            option_xpath = "//*[contains(text(), '24時間')]"
-            option = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.XPATH, option_xpath)))
-            driver.execute_script("arguments[0].click();", option)
-            print("✓ 24時間を選択しました（custom dropdown）")
-        else:
-            el_24h = driver.find_elements(By.XPATH, "//*[normalize-space(text())='24時間']")
-            if el_24h and el_24h[0].is_displayed():
-                print("✓ 24時間は既に選択されています")
-            else:
-                print("[!] ドロップダウンが見つかりません。続行します。")
-
-    except Exception as e:
-        print(f"[!] 24時間選択の警告: {e}")
-
-
-# ============================================================
-# 予約枠検索JavaScript（3段階ステータス版）
-# ============================================================
-# 【最強版の改善点】
-# 元のFastBookingは「clicked/none」の2段階だったが、
-# 最強版は「clicked/all_excluded/none」の3段階で判定する
-#
-# - 'clicked'      → 新しい枠をクリックした → 予約フローへ
-# - 'all_excluded' → 予約可能枠はあるが全てclicked_slotsに含まれる → 全枠予約済み → 終了
-# - 'none'         → 予約可能枠が0個 → まだDOMに出ていない → リトライ！
-# ============================================================
-JS_FIND_AND_CLICK = """
-var excludeList = arguments[0];
-var debug_all = [];
-var debug_bookable = [];
-var excluded_count = 0;
-
-var reserveButtons = document.querySelectorAll('a[btn-lesson-reserve="1"]');
-
-for (var i = 0; i < reserveButtons.length; i++) {
-    var btn = reserveButtons[i];
-    var btnText = (btn.innerText || btn.textContent || '').trim();
-    var btnClass = btn.className || '';
-    var timeFrom = btn.getAttribute('time-from') || '';
-    var timeTo = btn.getAttribute('time-to') || '';
-    var slotId = timeFrom || (timeFrom + '_' + timeTo);
-
-    if (debug_all.length < 15) {
-        debug_all.push(timeFrom + '~' + timeTo + ':' + btnText);
-    }
-
-    var isBookable = (
-        btnText.includes('予約可') ||
-        (btnClass.includes('btn') && btnClass.includes('blue') && btnClass.includes('fill'))
-    );
-    var isNotBookable = (
-        btnText.includes('予約済') ||
-        btnText.includes('×') ||
-        btnClass.includes('disabled') ||
-        btnClass.includes('reserved')
-    );
-
-    if (isBookable && !isNotBookable) {
-        debug_bookable.push(timeFrom + '(' + btnText + ')');
-
-        if (excludeList.indexOf(slotId) === -1) {
-            btn.click();
-            return {
-                'status': 'clicked',
-                'slot_id': slotId,
-                'time_from': timeFrom,
-                'time_to': timeTo,
-                'bookable_slots': debug_bookable,
-                'all_buttons': debug_all,
-                'total': reserveButtons.length
-            };
+    fetch("/q/dialog/lesson/reserve", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest"
+        },
+        body: "rand=" + Date.now() + "&teacher_id=" + teacherId
+            + "&date=" + dateStr
+            + "&time_from=" + encodeURIComponent(timeFrom)
+            + "&time_to=" + encodeURIComponent(timeTo)
+            + "&time_id=30&curriculum_id="
+    }).then(function(r) { return r.text(); })
+    .then(function(html) {
+        var m = html.match(/name="crumb"\\s+value="([^"]+)"/);
+        if (m) {
+            results[key] = { crumb: m[1], time_from: timeFrom, time_to: timeTo, status: "ok" };
         } else {
-            excluded_count++;
+            results[key] = { status: "no_crumb", time_from: timeFrom, time_to: timeTo };
         }
+    })
+    .catch(function(err) {
+        results[key] = { status: "error", time_from: timeFrom, time_to: timeTo, error: err.toString() };
+    })
+    .finally(function() {
+        completed++;
+        if (completed === total) {
+            callback(results);
+        }
+    });
+
+    if (index + 1 < total) {
+        setTimeout(function() { fetchSlot(index + 1); }, delay);
     }
 }
 
-return {
-    'status': (excluded_count > 0) ? 'all_excluded' : 'none',
-    'slot_id': null,
-    'bookable_slots': debug_bookable,
-    'all_buttons': debug_all,
-    'total': reserveButtons.length,
-    'excluded_count': excluded_count
-};
+fetchSlot(0);
 """
 
 # ============================================================
-# カリキュラム選択JavaScript
+# フェーズ2用JavaScript: 予約確定POST（1枠ずつ）
 # ============================================================
-JS_CURRICULUM = """
-var btn = document.querySelector('button[label*="カランメソッド"]');
-if (btn) { btn.click(); }
+JS_CONFIRM_RESERVE = """
+var crumb = arguments[0];
+var teacherId = arguments[1];
+var dateStr = arguments[2];
+var timeFrom = arguments[3];
+var timeTo = arguments[4];
+var curriculumId = arguments[5];
+var callback = arguments[6];
 
-var hiddenInput = document.querySelector('input[name="curriculum_id"]');
-if (hiddenInput) {
-    var val = hiddenInput.getAttribute('default-value') || '1010090';
-    hiddenInput.value = val;
-    hiddenInput.setAttribute('value', val);
-    hiddenInput.dispatchEvent(new Event('input', {bubbles: true}));
-    hiddenInput.dispatchEvent(new Event('change', {bubbles: true}));
-    return {
-        'status': 'ok',
-        'button_found': btn !== null,
-        'button_label': btn ? btn.getAttribute('label') : null,
-        'input_value': hiddenInput.value
-    };
-}
-return {'status': 'error', 'msg': 'hidden input not found'};
+fetch("/q/api/student/lesson/reserve", {
+    method: "POST",
+    headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest"
+    },
+    body: "rand=" + Date.now()
+        + "&crumb=" + encodeURIComponent(crumb)
+        + "&teacher_id=" + teacherId
+        + "&date=" + dateStr
+        + "&time_from=" + encodeURIComponent(timeFrom)
+        + "&time_to=" + encodeURIComponent(timeTo)
+        + "&time_id=30"
+        + "&paid_by_id=1"
+        + "&curriculum_id=" + curriculumId
+        + "&allow_substitute_flag=f"
+}).then(function(r) { return r.json(); })
+.then(function(j) {
+    callback(j);
+})
+.catch(function(err) {
+    callback({ is_success: 0, error: err.toString() });
+});
 """
 
 
@@ -331,17 +297,18 @@ target_date, day_name, date_str = get_target_date_info()
 
 # 開始メッセージ
 print("=" * 60)
-print("Ady先生専用 朝4:00 予約争奪戦スナイパー【最強版】")
+print("Ady先生専用 朝4:00 予約スナイパー【直接POST版】")
 print("=" * 60)
-print(f"\n  先生: Ady")
+print(f"\n  先生: Ady (teacher_id={TEACHER_ID})")
 print(f"  ターゲット日付: {date_str} ({day_name})")
-print(f"  モード: {'TEST（確定クリックなし）' if TEST_MODE else '本番（実予約あり）'}")
+print(f"  モード: {'TEST（確定POSTなし）' if TEST_MODE else '本番（実予約あり）'}")
 print(f"  最大予約数: {MAX_BOOKINGS}")
-print(f"  リトライ間隔: {REFRESH_INTERVAL*1000:.0f}ms")
-print(f"  最大リトライ: {MAX_RETRIES}回（{MAX_RETRIES*REFRESH_INTERVAL:.1f}秒）")
+print(f"  カリキュラム: カランメソッド ({CURRICULUM_ID})")
+print(f"  対象枠数: {len(SLOT_PRIORITY)}枠")
+print(f"  優先順位: {' > '.join(s[0] for s in SLOT_PRIORITY)}")
 print(f"\n【タイムライン】")
-print(f"  {WAKEUP_TIME_STR} - ページ事前準備")
-print(f"  {SNIPE_TIME_STR} - リフレッシュ＆予約開始")
+print(f"  {WAKEUP_TIME_STR} - ログイン＆ページ事前準備")
+print(f"  {SNIPE_TIME_STR} - 直接POST送信（リロードなし）")
 print("=" * 60)
 
 # 認証情報の確認
@@ -372,10 +339,8 @@ try:
     chrome_driver = webdriver.Chrome(options=chrome_options)
     chrome_driver.set_window_size(1280, 800)
     chrome_driver.set_page_load_timeout(60)
-    chrome_driver.set_script_timeout(60)
+    chrome_driver.set_script_timeout(30)
     print("✓ Chromeブラウザの起動に成功しました")
-
-    wait = WebDriverWait(chrome_driver, 20)
 
     # ============================================================
     # フェーズ1: ログイン
@@ -387,7 +352,7 @@ try:
     try:
         chrome_driver.get('https://qqeng.com/q/login/')
     except Exception:
-        pass  # [Cron] ページロードタイムアウト時も続行
+        pass
     print(f"✓ ログインページを開きました: {chrome_driver.current_url}")
     time.sleep(2)
 
@@ -411,12 +376,12 @@ try:
     try:
         password_input.submit()
     except Exception:
-        pass  # [Cron] タイムアウト時も続行
+        pass
     time.sleep(5)
     print("✓ ログインが完了しました")
 
     # ============================================================
-    # フェーズ2: Ady先生のスケジュールページに移動
+    # フェーズ2: Ady先生のスケジュールページに移動（セッション維持）
     # ============================================================
     print("\n" + "=" * 60)
     print("フェーズ2: Ady先生のスケジュールページに移動")
@@ -429,336 +394,141 @@ try:
     try:
         chrome_driver.get(teacher_schedule_url)
     except Exception:
-        pass  # [Cron] タイムアウト時も続行
+        pass
     time.sleep(3)
-
-    ensure_24h_selected(chrome_driver)
-    print("✓ Ady先生のスケジュールページを開きました")
+    print("✓ Ady先生のスケジュールページを開きました（セッションCookie取得済み）")
 
     # ============================================================
-    # [Cron] input()をスキップして自動続行
-    # ============================================================
-    print("[Cron] input()をスキップして自動続行します")
-    time.sleep(3)
-
-    # ============================================================
-    # フェーズ3: 予約争奪戦の準備（4:00AMタイミング）
+    # フェーズ3: 予約争奪戦の準備
     # ============================================================
     print("\n" + "=" * 60)
     print("フェーズ3: 予約争奪戦の準備")
     print("=" * 60)
     print(f"[*] ページ事前準備: {WAKEUP_TIME_STR}")
-    print(f"[*] リフレッシュ＆予約開始: {SNIPE_TIME_STR}")
+    print(f"[*] POST送信開始: {SNIPE_TIME_STR}")
 
-    # ステップ1: 起床時刻（3:58）まで待機
+    # ステップ1: 起床時刻まで待機
     wait_until_time(WAKEUP_TIME_STR, purpose="（ページ事前準備）")
 
     # ステップ2: 日付を再計算（深夜0時を跨いだ場合に備えて）
     target_date, day_name, date_str = get_target_date_info()
     print(f"\n[*] ターゲット日付（再計算）: {date_str} ({day_name})")
 
-    # ステップ3: ページを事前準備
+    # ステップ3: ページを事前準備（セッション維持のためリロード）
     teacher_schedule_url = f"{TEACHER_URL_ADY}?date={date_str}&time_span=0&lesson_time=30"
     print(f"[-] ページを事前準備します: {teacher_schedule_url}")
     try:
         chrome_driver.get(teacher_schedule_url)
     except Exception:
-        pass  # [Cron] タイムアウト時も続行
+        pass
     time.sleep(2)
-    ensure_24h_selected(chrome_driver)
-    print("✓ ページの事前準備完了")
+    print("✓ ページの事前準備完了（セッション維持確認）")
 
-    # ステップ4: スナイプ時刻（3:59:58.0）まで精密待機
+    # ステップ4: スナイプ時刻まで精密待機
     print("\n" + "-" * 60)
     print("【重要】スナイプ時刻まで精密待機中...")
-    print(f"{SNIPE_TIME_STR} にリフレッシュして即座に予約を開始します")
+    print(f"{SNIPE_TIME_STR} に10枠同時POST送信します（リロードなし）")
     print("-" * 60)
     wait_until_snipe_time_precise()
 
-    # ステップ5: 3:59:58.0 - リフレッシュ実行！
-    print("\n" + "=" * 60)
-    print(f"★★★ {SNIPE_TIME_STR} - リフレッシュ実行！ ★★★")
-    print("=" * 60)
-    chrome_driver.set_page_load_timeout(2)  # [Cron] 2秒でタイムアウトして即予約ループへ
-    try:
-        chrome_driver.execute_script("location.reload()")
-    except Exception:
-        pass  # [Cron] タイムアウト時も続行
-    chrome_driver.set_page_load_timeout(60)  # [Cron] 予約ループ用に戻す
-    print(f"✓ リフレッシュ実行: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
-
-    # ページ読み込み完了を待機
-    print("[-] ページ読み込み中...")
-    try:
-        WebDriverWait(chrome_driver, 10).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
-        print(f"✓ ページ読み込み完了: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
-    except:
-        print(f"[!] ページ読み込みタイムアウト - 続行します: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
-
-    time.sleep(0.3)
-    print(f"✓ 予約ループ開始: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
-
     # ============================================================
-    # フェーズ4: 予約ループ（whileリトライ + clicked_slots重複防止）
-    # ============================================================
-    #
-    # 【最強版のループ構造】
-    #
-    #   while success_count < MAX_BOOKINGS:
-    #     ├─ JS実行（clicked_slotsで除外）
-    #     ├─ status == 'clicked'      → 予約フローへ進む
-    #     ├─ status == 'all_excluded' → 全枠予約済み → ループ終了
-    #     └─ status == 'none'         → 枠未出現 → 50ms後にリトライ！
-    #
-    # これにより:
-    # - 4:00:00に枠がまだDOMに無い → リトライで捕まえる（元FastBookingの強み）
-    # - 同じ枠を2度クリックしない → clicked_slotsで防止（Ady版の強み）
-    # - 全枠を予約し終えたら即終了 → all_excludedで判定（新規追加）
+    # フェーズ4: 直接POST予約（2段階方式）
     # ============================================================
     print("\n" + "=" * 60)
-    print(f"フェーズ4: 予約ループ開始")
-    print(f"  モード: {'TEST（確定クリックなし）' if TEST_MODE else '本番（実予約あり）'}")
-    print(f"  ターゲット日付: {date_str} ({day_name})")
-    print(f"  最大予約数: {MAX_BOOKINGS}")
-    print(f"  リトライ: 最大{MAX_RETRIES}回（{MAX_RETRIES*REFRESH_INTERVAL:.1f}秒）")
+    print(f"★★★ {SNIPE_TIME_STR} - 直接POST送信開始！ ★★★")
     print("=" * 60)
+    print(f"  送信時刻: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
 
-    clicked_slots = []
-    success_count = 0
-    retry_count = 0
+    # ----------------------------------------------------------
+    # 4-1. フェーズ1: 10枠同時にダイアログ取得POST → crumb取得
+    # ----------------------------------------------------------
+    SLOT_DELAY_MS = 50  # 枠間の送信間隔（50ms）
+    print(f"\n[-] フェーズ1: {len(SLOT_PRIORITY)}枠を{SLOT_DELAY_MS}ms間隔で順次POST送信中...")
 
-    while success_count < MAX_BOOKINGS:
+    slots_list = [[s[0], s[1]] for s in SLOT_PRIORITY]
+
+    chrome_driver.set_script_timeout(15)
+    dialog_results = chrome_driver.execute_async_script(
+        JS_FETCH_DIALOGS, slots_list, TEACHER_ID, date_str, SLOT_DELAY_MS
+    )
+
+    print(f"✓ ダイアログ取得完了: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
+
+    # 結果を表示
+    available_slots = []
+    for time_from, time_to in SLOT_PRIORITY:
+        result = dialog_results.get(time_from, {})
+        status = result.get('status', 'missing')
+        if status == 'ok':
+            available_slots.append((time_from, time_to, result['crumb']))
+            print(f"  ✓ {time_from}〜{time_to} : 枠あり（crumb取得済み）")
+        elif status == 'no_crumb':
+            print(f"  × {time_from}〜{time_to} : 枠なし")
+        else:
+            print(f"  ! {time_from}〜{time_to} : エラー ({status})")
+
+    print(f"\n  オープン枠数: {len(available_slots)}/{len(SLOT_PRIORITY)}")
+
+    if not available_slots:
+        print("\n[!] オープンされた枠が0個です。予約できません。")
+    else:
         # ----------------------------------------------------------
-        # 4-1. 予約可能枠を検索してクリック（3段階ステータス判定）
+        # 4-2. フェーズ2: 優先順位に従って確定POST（最大3枠）
         # ----------------------------------------------------------
-        click_result = chrome_driver.execute_script(JS_FIND_AND_CLICK, clicked_slots)
-        status = click_result['status'] if click_result else 'none'
+        print(f"\n[-] フェーズ2: 優先順位に従って予約確定POST送信中...")
+        print(f"  モード: {'TEST（送信しない）' if TEST_MODE else '本番（実予約）'}")
 
-        # --- status: 'none' → 枠がまだDOMに出ていない → リトライ ---
-        if status == 'none':
-            retry_count += 1
-            if retry_count >= MAX_RETRIES:
-                print(f"\n[!] リトライ上限到達（{MAX_RETRIES}回 = {MAX_RETRIES*REFRESH_INTERVAL:.1f}秒）")
-                print(f"  予約可能枠が見つかりませんでした")
+        success_count = 0
+        booked_slots = []
+
+        for time_from, time_to, crumb in available_slots:
+            if success_count >= MAX_BOOKINGS:
+                print(f"\n[*] 最大予約数（{MAX_BOOKINGS}）に達しました")
                 break
-            if retry_count == 1 or retry_count % 20 == 0:
-                print(f"[-] 予約可能枠なし... リトライ中 ({retry_count}/{MAX_RETRIES})")
-            time.sleep(REFRESH_INTERVAL)
-            continue
 
-        # --- status: 'all_excluded' → 全枠が予約済み → 終了 ---
-        if status == 'all_excluded':
-            print(f"\n[*] 予約可能枠は全てclicked_slotsに含まれています")
-            print(f"  予約済み枠: {clicked_slots}")
-            print(f"  検出された予約可枠: {click_result.get('bookable_slots', [])}")
-            break
+            attempt = success_count + 1
+            print(f"\n  【予約 {attempt}/{MAX_BOOKINGS}】 {time_from}〜{time_to}")
 
-        # --- status: 'clicked' → 新しい枠をクリックした → 予約フローへ ---
-        retry_count = 0  # リトライカウンタをリセット
-
-        slot_id = click_result['slot_id']
-        time_from = click_result['time_from']
-        time_to = click_result['time_to']
-        clicked_slots.append(slot_id)
-
-        attempt = success_count + 1
-        print(f"\n{'='*60}")
-        print(f"【予約 {attempt}/{MAX_BOOKINGS}】 TEST_MODE={TEST_MODE}")
-        print(f"{'='*60}")
-        print(f"[DEBUG] btn-lesson-reserve要素数: {click_result['total']}")
-        print(f"[DEBUG] 予約可能枠: {click_result['bookable_slots']}")
-        print(f"★ 枠をクリック: time-from={time_from}, time-to={time_to}")
-        print(f"  クリック時刻: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
-
-        # ----------------------------------------------------------
-        # 4-2. モーダル表示をWebDriverWaitで待機
-        # ----------------------------------------------------------
-        print(f"[-] モーダル表示を待機中...")
-        confirm_xpath = "//*[contains(text(), '予約を確定する')]"
-        try:
-            WebDriverWait(chrome_driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, confirm_xpath))
-            )
-            print(f"✓ モーダルが表示されました")
-        except Exception as e:
-            print(f"[!] モーダル表示待ちでタイムアウト: {e}")
-            continue
-
-        # ----------------------------------------------------------
-        # 4-3. カリキュラム選択（カランメソッド）
-        # ----------------------------------------------------------
-        print(f"[-] カリキュラムを選択中...")
-
-        curriculum_result = chrome_driver.execute_script(JS_CURRICULUM)
-
-        if curriculum_result and curriculum_result.get('status') == 'ok':
-            print(f"✓ カリキュラム選択: "
-                  f"{curriculum_result.get('button_label')} "
-                  f"(value={curriculum_result.get('input_value')})")
-        else:
-            print(f"[!] カリキュラム自動選択失敗: {curriculum_result}")
-
-        # ----------------------------------------------------------
-        # 4-4. 予約確定（TEST_MODE / 本番分岐）
-        # ----------------------------------------------------------
-        if TEST_MODE:
-            # === TEST_MODE: 確定ボタンの存在確認のみ ===
-            print(f"[-] [TEST] 確定ボタンの存在を確認中...")
-            try:
-                confirm_btn = WebDriverWait(chrome_driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, confirm_xpath))
-                )
-                print(f"✓ [TEST] 「予約を確定する」ボタンはクリック可能 → クリックしません")
-            except Exception as e:
-                print(f"[!] [TEST] 確定ボタンが見つからない/クリック不可: {e}")
-
-            # モーダルを閉じてスケジュールへ戻る
-            print(f"[-] [TEST] モーダルを閉じます...")
-            modal_closed = False
-
-            close_selectors = [
-                "button.close", ".modal .close", "[aria-label='Close']",
-                ".modal-header .close", ".btn-close",
-            ]
-            close_xpaths = [
-                "//*[contains(@class,'modal')]//*[contains(text(),'閉じる')]",
-                "//*[contains(@class,'modal')]//*[contains(text(),'キャンセル')]",
-                "//*[contains(@class,'modal')]//*[contains(text(),'戻る')]",
-                "//*[contains(@class,'modal')]//*[text()='×']",
-            ]
-
-            for sel in close_selectors:
-                try:
-                    elems = chrome_driver.find_elements(By.CSS_SELECTOR, sel)
-                    for elem in elems:
-                        if elem.is_displayed():
-                            chrome_driver.execute_script("arguments[0].click();", elem)
-                            print(f"  (a) クローズボタンをクリック: {sel}")
-                            modal_closed = True
-                            break
-                    if modal_closed:
-                        break
-                except:
-                    continue
-
-            if not modal_closed:
-                for xp in close_xpaths:
-                    try:
-                        elems = chrome_driver.find_elements(By.XPATH, xp)
-                        for elem in elems:
-                            if elem.is_displayed():
-                                chrome_driver.execute_script("arguments[0].click();", elem)
-                                print(f"  (a) クローズボタンをクリック(xpath)")
-                                modal_closed = True
-                                break
-                        if modal_closed:
-                            break
-                    except:
-                        continue
-
-            if not modal_closed:
-                try:
-                    ActionChains(chrome_driver).send_keys(Keys.ESCAPE).perform()
-                    print(f"  (b) ESCキーを送信しました")
-                    time.sleep(1)
-                    still_visible = chrome_driver.find_elements(By.XPATH, confirm_xpath)
-                    if not still_visible or not any(e.is_displayed() for e in still_visible):
-                        modal_closed = True
-                except:
-                    pass
-
-            if not modal_closed:
-                try:
-                    overlay = chrome_driver.find_elements(By.CSS_SELECTOR,
-                        ".modal-backdrop, .overlay, .modal-overlay")
-                    if overlay:
-                        chrome_driver.execute_script("arguments[0].click();", overlay[0])
-                        print(f"  (c) オーバーレイ外をクリックしました")
-                        time.sleep(1)
-                        still_visible = chrome_driver.find_elements(By.XPATH, confirm_xpath)
-                        if not still_visible or not any(e.is_displayed() for e in still_visible):
-                            modal_closed = True
-                except:
-                    pass
-
-            if not modal_closed:
-                print(f"  (d) 最終手段: ページを再読み込みします")
-                try:
-                    chrome_driver.get(teacher_schedule_url)
-                except Exception:
-                    pass
-
-            print(f"[-] [TEST] スケジュール復帰を待機中...")
-            try:
-                WebDriverWait(chrome_driver, 15).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, "a[btn-lesson-reserve]"))
-                )
+            if TEST_MODE:
+                print(f"  [TEST] crumb={crumb[:20]}... → 確定POSTは送信しません")
                 success_count += 1
-                print(f"✓ [TEST] 検証成功 (time-from={time_from})")
-            except Exception as e:
-                print(f"[!] [TEST] スケジュール復帰タイムアウト: {e}")
-                try:
-                    chrome_driver.get(teacher_schedule_url)
-                except Exception:
-                    pass
-                time.sleep(3)
-
-        else:
-            # === 本番モード: 実際に予約を確定する ===
-            print(f"[-] 予約確定ボタンをクリックします...")
-            try:
-                confirm_btn = WebDriverWait(chrome_driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, confirm_xpath))
-                )
-                chrome_driver.execute_script("arguments[0].click();", confirm_btn)
-                print(f"✓ 予約確定ボタンをクリックしました")
-            except Exception as e:
-                print(f"[!] 確定ボタンのクリック失敗: {e}")
+                booked_slots.append(f"{time_from}〜{time_to}")
                 continue
 
-            # 成功モーダルを待機
-            print(f"[-] 予約結果を待機中...")
-            try:
-                continue_xpath = "//*[contains(text(), '他の予約を続ける')]"
-                continue_btn = WebDriverWait(chrome_driver, 15).until(
-                    EC.element_to_be_clickable((By.XPATH, continue_xpath))
-                )
+            # 確定POST送信
+            chrome_driver.set_script_timeout(10)
+            confirm_result = chrome_driver.execute_async_script(
+                JS_CONFIRM_RESERVE,
+                crumb, TEACHER_ID, date_str, time_from, time_to, CURRICULUM_ID
+            )
+
+            if confirm_result and confirm_result.get('is_success') == 1:
                 success_count += 1
-                print(f"\n{'='*60}")
-                print(f"★★★ 予約成功！（{success_count}/{MAX_BOOKINGS}）★★★")
-                print(f"  時間: time-from={time_from}")
-                print(f"  時刻: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
-                print(f"{'='*60}")
-
-                # 「他の予約を続ける」をクリックしてスケジュールへ戻る
-                chrome_driver.execute_script("arguments[0].click();", continue_btn)
-                print(f"[-] 「他の予約を続ける」をクリック → スケジュールへ戻ります")
-
-                WebDriverWait(chrome_driver, 15).until(
-                    EC.presence_of_element_located(
-                        (By.CSS_SELECTOR, "a[btn-lesson-reserve]"))
-                )
-                print(f"✓ スケジュールが再表示されました")
-
-            except Exception as e:
-                print(f"[!] 成功モーダルが表示されませんでした: {e}")
-
-        # 周回間の短い待機（DOM安定化）
-        time.sleep(0.5)
+                booked_slots.append(f"{time_from}〜{time_to}")
+                lesson = confirm_result.get('lesson', {})
+                print(f"  ★★★ 予約成功！ ★★★")
+                print(f"    時刻: {datetime.datetime.now().strftime('%H:%M:%S.%f')}")
+                print(f"    lesson_id: {lesson.get('id', 'N/A')}")
+                print(f"    date: {lesson.get('date', 'N/A')}")
+                print(f"    time: {lesson.get('time_span', 'N/A')}")
+            else:
+                error_msg = confirm_result.get('error', 'unknown') if confirm_result else 'no response'
+                error_cd = confirm_result.get('error_cd', '') if confirm_result else ''
+                print(f"  [!] 予約失敗: {error_msg} (error_cd={error_cd})")
 
     # ============================================================
-    # ループ終了サマリー
+    # 予約結果サマリー
     # ============================================================
+    final_success = len(booked_slots) if 'booked_slots' in dir() else 0
     print(f"\n{'='*60}")
-    print(f"【予約ループ完了】")
+    print(f"【予約結果サマリー】")
     print(f"  先生: Ady")
     print(f"  モード: {'TEST' if TEST_MODE else '本番'}")
-    print(f"  成功: {success_count}/{MAX_BOOKINGS}")
-    print(f"  クリック済み枠: {clicked_slots}")
-    print(f"  リトライ回数: {retry_count}")
+    print(f"  ターゲット日付: {date_str} ({day_name})")
+    print(f"  オープン枠: {len(available_slots) if 'available_slots' in dir() else 0}")
+    print(f"  予約成功: {final_success}/{MAX_BOOKINGS}")
+    if 'booked_slots' in dir() and booked_slots:
+        print(f"  予約済み枠: {', '.join(booked_slots)}")
     print(f"{'='*60}")
 
     # ============================================================
@@ -767,6 +537,13 @@ try:
     print("\n" + "-" * 60)
     print("スクリーンショットを撮影しています...")
     print("-" * 60)
+
+    # スケジュールページをリロードして最終状態を撮影
+    try:
+        chrome_driver.get(teacher_schedule_url)
+        time.sleep(3)
+    except Exception:
+        pass
 
     timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
     screenshot_filename = f"qqenglish_fastbooking_ady_{timestamp}.png"
@@ -785,8 +562,9 @@ try:
     print("=" * 60)
     print(f"  先生: Ady")
     print(f"  ターゲット日付: {date_str} ({day_name})")
-    print(f"  予約成功数: {success_count}/{MAX_BOOKINGS}")
-    print(f"  スクリーンショット: {screenshot_path}")
+    print(f"  予約成功数: {final_success}/{MAX_BOOKINGS}")
+    if 'screenshot_path' in dir():
+        print(f"  スクリーンショット: {screenshot_path}")
     print("ブラウザは自動終了します。")
     print("=" * 60)
 
